@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "accurate-fly-brain"
+version = "0.1.0"
+description = "Accurate MaleCNS whole-CNS LIF simulation with video sensory input"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "numba>=0.57",
+    "opencv-python-headless>=4.8",
+    "tqdm>=4.65",
+    "flybrain>=0.1.0",
+]
+
+[project.scripts]
+fly-watch = "watch_video:main"

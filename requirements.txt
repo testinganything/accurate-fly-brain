@@ -1,0 +1,10 @@
+numpy>=1.24
+scipy>=1.10
+numba>=0.57
+opencv-python-headless>=4.8
+tqdm>=4.65
+# Optional but recommended for speed
+# cupy-cuda12x   # uncomment if you have an NVIDIA GPU + CUDA 12
+
+# The high-quality MaleCNS LIF runtime
+flybrain>=0.1.0
