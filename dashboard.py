@@ -1,5 +1,6 @@
 """
 Live + final visual dashboard for the MaleCNS video simulation.
+Falls back to non-interactive (Agg) backend when Tk/Tcl is unavailable.
 """
 
 from __future__ import annotations
@@ -8,23 +9,48 @@ from pathlib import Path
 
 import numpy as np
 
+HAS_MPL = False
+LIVE_OK = False
+
 try:
     import matplotlib
-    matplotlib.use("TkAgg")  # interactive on Windows
-    import matplotlib.pyplot as plt
+
+    # Prefer interactive backend; fall back to Agg if Tk/Tcl is broken (common on Laragon)
+    try:
+        matplotlib.use("TkAgg")
+        import matplotlib.pyplot as plt
+
+        # Probe whether a window can actually be created
+        _fig = plt.figure()
+        plt.close(_fig)
+        LIVE_OK = True
+    except Exception:
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        LIVE_OK = False
+
     from matplotlib.gridspec import GridSpec
+
     HAS_MPL = True
 except Exception:
     HAS_MPL = False
+    LIVE_OK = False
 
 
 class Dashboard:
     def __init__(self, brain, pathway_idx: dict, live: bool = True, title: str = "MaleCNS"):
         self.brain = brain
         self.pathway_idx = pathway_idx
-        self.live = live and HAS_MPL
         self.title = title
         self.positions = getattr(brain, "positions", None)
+
+        self.live = bool(live and HAS_MPL and LIVE_OK)
+        if live and HAS_MPL and not LIVE_OK:
+            print(
+                "[dashboard] Live window unavailable (Tk/Tcl missing). "
+                "Will save plots at the end instead."
+            )
 
         self.fig = None
         self.axes = {}
@@ -48,19 +74,16 @@ class Dashboard:
         self.fig.suptitle(self.title, fontsize=13)
         gs = GridSpec(2, 3, figure=self.fig, height_ratios=[1.1, 1], width_ratios=[1.1, 1, 1])
 
-        # Video frame
         self.axes["frame"] = self.fig.add_subplot(gs[0, 0])
         self.axes["frame"].set_title("Input frame")
         self.axes["frame"].axis("off")
 
-        # Total activity
         self.axes["total"] = self.fig.add_subplot(gs[0, 1])
         self.axes["total"].set_title("Total active neurons")
         self.axes["total"].set_xlabel("Time (s)")
         self.axes["total"].set_ylabel("# spiking")
         (self._total_line,) = self.axes["total"].plot([], [], color="#e74c3c", lw=1.5)
 
-        # Pathway activity
         self.axes["path"] = self.fig.add_subplot(gs[0, 2])
         self.axes["path"].set_title("Key pathways")
         self.axes["path"].set_xlabel("Time (s)")
@@ -71,19 +94,23 @@ class Dashboard:
             self._pathway_lines[name] = line
         self.axes["path"].legend(loc="upper right", fontsize=7)
 
-        # 3D / 2D neuron map
         self.axes["map"] = self.fig.add_subplot(gs[1, :])
         self.axes["map"].set_title("Active neurons (soma positions)")
         self.axes["map"].set_xlabel("X")
         self.axes["map"].set_ylabel("Y")
         if self.positions is not None:
-            # Background: all somata faint
             pos = np.asarray(self.positions)
             self.axes["map"].scatter(pos[:, 0], pos[:, 1], s=1, c="#dddddd", alpha=0.4)
             self._scatter = self.axes["map"].scatter([], [], s=6, c="#e74c3c", alpha=0.85)
         else:
-            self.axes["map"].text(0.5, 0.5, "No soma positions in this brain build",
-                                  ha="center", va="center", transform=self.axes["map"].transAxes)
+            self.axes["map"].text(
+                0.5,
+                0.5,
+                "No soma positions in this brain build",
+                ha="center",
+                va="center",
+                transform=self.axes["map"].transAxes,
+            )
 
         self._text = self.fig.text(0.01, 0.01, "", fontsize=9, family="monospace")
         plt.tight_layout()
@@ -98,29 +125,29 @@ class Dashboard:
         for k, v in pathway_counts.items():
             self._path[k].append(v)
 
-        # Frame
         if frame is not None:
-            rgb = frame[:, :, ::-1]  # BGR → RGB
+            rgb = frame[:, :, ::-1]
             if self._img_artist is None:
                 self._img_artist = self.axes["frame"].imshow(rgb)
             else:
                 self._img_artist.set_data(rgb)
 
-        # Total line
         self._total_line.set_data(self._t, self._total)
         self.axes["total"].relim()
         self.axes["total"].autoscale_view()
 
-        # Pathway lines
         for name, line in self._pathway_lines.items():
             line.set_data(self._t, self._path[name])
         self.axes["path"].relim()
         self.axes["path"].autoscale_view()
 
-        # Active neuron map
-        if self._scatter is not None and fired is not None and len(fired) and self.positions is not None:
+        if (
+            self._scatter is not None
+            and fired is not None
+            and len(fired)
+            and self.positions is not None
+        ):
             pos = np.asarray(self.positions)
-            # Subsample for speed if huge
             idx = fired if len(fired) < 8000 else np.random.choice(fired, 8000, replace=False)
             pts = pos[idx]
             self._scatter.set_offsets(pts[:, :2])
@@ -130,9 +157,12 @@ class Dashboard:
             + "  ".join(f"{k}: {v}" for k, v in pathway_counts.items())
         )
 
-        self.fig.canvas.draw_idle()
-        self.fig.canvas.flush_events()
-        plt.pause(0.001)
+        try:
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
+            plt.pause(0.001)
+        except Exception:
+            pass
 
     def finalize(self, times, history, total_spikes, out_dir: Path):
         """Save high-quality static plots at the end."""
@@ -153,7 +183,8 @@ class Dashboard:
         axes[0].grid(True, alpha=0.3)
 
         for name, series in history.items():
-            axes[1].plot(times, series, label=name, lw=1.3)
+            if len(series) == len(times):
+                axes[1].plot(times, series, label=name, lw=1.3)
         axes[1].set_xlabel("Time (s)")
         axes[1].set_ylabel("# spiking in pathway")
         axes[1].set_title("Key pathways")
@@ -166,10 +197,10 @@ class Dashboard:
         plt.close(fig)
         print(f"  saved {p1}")
 
-        # 2) Summary bar chart of mean pathway activity
+        # 2) Summary bar chart
         if history:
             names = list(history.keys())
-            means = [np.mean(history[n]) for n in names]
+            means = [float(np.mean(history[n])) if history[n] else 0.0 for n in names]
             fig, ax = plt.subplots(figsize=(9, 4))
             ax.barh(names, means, color="#3498db")
             ax.set_xlabel("Mean # spiking neurons per step")
@@ -180,8 +211,13 @@ class Dashboard:
             plt.close(fig)
             print(f"  saved {p2}")
 
-        # Keep live window open a moment so user can look
+        # 3) Final active-neuron map if we have positions + last fired state isn't stored;
+        #    skip detailed map here — activity plots are the main deliverable.
+
         if self.live and self.fig is not None:
             print("Close the live dashboard window to exit.")
-            plt.ioff()
-            plt.show()
+            try:
+                plt.ioff()
+                plt.show()
+            except Exception:
+                pass
