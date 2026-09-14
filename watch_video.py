@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
-Advanced MaleCNS whole-CNS simulation with live visual dashboard.
-
-Feeds any video into the real fruit-fly visual system and shows:
-  - Activity over time in key pathways (escape, descending, motor, visual)
-  - 3D map of currently active neurons (if positions available)
-  - Summary statistics and strongest-driven cell types
+Advanced MaleCNS whole-CNS simulation with live OpenCV dashboard.
 """
 
 from __future__ import annotations
@@ -29,7 +24,6 @@ from visual_encoder import VisualFrontEnd
 from dashboard import Dashboard
 
 
-# Key pathways we track (real MaleCNS cell types / superclasses)
 PATHWAYS = {
     "looming / escape": ["LC4", "LPLC2", "DNp01"],
     "descending": ["descending_neuron"],
@@ -41,14 +35,14 @@ PATHWAYS = {
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Advanced video → MaleCNS fly brain with visual dashboard"
+        description="Advanced video → MaleCNS fly brain with live visual dashboard"
     )
     parser.add_argument("video", type=str, help="Path to video file")
     parser.add_argument("--duration", type=float, default=20.0, help="Seconds of video to process")
     parser.add_argument("--gain", type=float, default=0.9, help="Visual drive strength")
     parser.add_argument("--dt", type=float, default=0.020, help="Brain step (s)")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--no-live", action="store_true", help="Skip live window (only save plots at end)")
+    parser.add_argument("--no-live", action="store_true", help="Skip live window")
     parser.add_argument("--out", type=str, default="output", help="Folder for saved plots")
     args = parser.parse_args()
 
@@ -64,7 +58,6 @@ def main():
     brain = FlyBrain(device=args.device, dt=args.dt)
     print(f"Brain ready — {brain.n} neurons  |  device={brain.device}")
 
-    # Resolve pathway neuron indices once
     pathway_idx = {}
     for name, types in PATHWAYS.items():
         try:
@@ -75,7 +68,6 @@ def main():
         except Exception:
             pass
 
-    # Also try Giant Fiber specifically
     try:
         gf = brain.cells(["DNp01"])
         if len(gf):
@@ -99,13 +91,12 @@ def main():
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(args.duration * fps)
-    # Process roughly one frame per brain step for smoother drive
     frames_per_step = max(1, int(round(fps * args.dt)))
 
     print(f"\nProcessing up to {args.duration}s @ ~{fps:.1f} fps")
-    print("Close the dashboard window or wait for finish to save final plots.\n")
+    print("Live window should appear. Press Q in that window to stop early.\n")
 
-    history = defaultdict(list)  # pathway → list of spike counts
+    history = defaultdict(list)
     times = []
     total_spikes_hist = []
 
@@ -118,7 +109,6 @@ def main():
         if not ret:
             break
 
-        # Only step the brain every frames_per_step video frames
         if frame_i % frames_per_step == 0:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.resize(gray, (96, 72))
@@ -137,7 +127,6 @@ def main():
                 count = sum(1 for i in idx if i in fired_set)
                 history[name].append(count)
 
-            # Live dashboard update
             dash.update(
                 t=t,
                 frame=frame,
@@ -145,6 +134,10 @@ def main():
                 pathway_counts={k: history[k][-1] for k in history},
                 total_active=n_active,
             )
+
+            if getattr(dash, "stop_requested", False):
+                print("\nStopped early by user (Q pressed).")
+                break
 
             step += 1
 

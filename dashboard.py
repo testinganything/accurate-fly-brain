@@ -1,41 +1,25 @@
 """
-Live + final visual dashboard for the MaleCNS video simulation.
-Falls back to non-interactive (Agg) backend when Tk/Tcl is unavailable.
+Live dashboard via OpenCV (works without Tcl/Tk) + matplotlib plots saved at the end.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 
+# Matplotlib only for final saved plots (Agg = no GUI needed)
 HAS_MPL = False
-LIVE_OK = False
-
 try:
     import matplotlib
 
-    # Prefer interactive backend; fall back to Agg if Tk/Tcl is broken (common on Laragon)
-    try:
-        matplotlib.use("TkAgg")
-        import matplotlib.pyplot as plt
-
-        # Probe whether a window can actually be created
-        _fig = plt.figure()
-        plt.close(_fig)
-        LIVE_OK = True
-    except Exception:
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        LIVE_OK = False
-
-    from matplotlib.gridspec import GridSpec
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
     HAS_MPL = True
 except Exception:
-    HAS_MPL = False
-    LIVE_OK = False
+    pass
 
 
 class Dashboard:
@@ -44,136 +28,241 @@ class Dashboard:
         self.pathway_idx = pathway_idx
         self.title = title
         self.positions = getattr(brain, "positions", None)
+        self.live = live
 
-        self.live = bool(live and HAS_MPL and LIVE_OK)
-        if live and HAS_MPL and not LIVE_OK:
-            print(
-                "[dashboard] Live window unavailable (Tk/Tcl missing). "
-                "Will save plots at the end instead."
-            )
-
-        self.fig = None
-        self.axes = {}
-        self._pathway_lines = {}
-        self._total_line = None
-        self._scatter = None
-        self._img_artist = None
-        self._text = None
-
-        # Rolling history for live plot
         self._t = []
         self._total = []
         self._path = {k: [] for k in pathway_idx}
 
+        self.window = "MaleCNS Live Dashboard"
         if self.live:
-            self._init_live()
-
-    def _init_live(self):
-        plt.ion()
-        self.fig = plt.figure(figsize=(14, 8))
-        self.fig.suptitle(self.title, fontsize=13)
-        gs = GridSpec(2, 3, figure=self.fig, height_ratios=[1.1, 1], width_ratios=[1.1, 1, 1])
-
-        self.axes["frame"] = self.fig.add_subplot(gs[0, 0])
-        self.axes["frame"].set_title("Input frame")
-        self.axes["frame"].axis("off")
-
-        self.axes["total"] = self.fig.add_subplot(gs[0, 1])
-        self.axes["total"].set_title("Total active neurons")
-        self.axes["total"].set_xlabel("Time (s)")
-        self.axes["total"].set_ylabel("# spiking")
-        (self._total_line,) = self.axes["total"].plot([], [], color="#e74c3c", lw=1.5)
-
-        self.axes["path"] = self.fig.add_subplot(gs[0, 2])
-        self.axes["path"].set_title("Key pathways")
-        self.axes["path"].set_xlabel("Time (s)")
-        self.axes["path"].set_ylabel("# spiking")
-        colors = plt.cm.tab10(np.linspace(0, 1, max(len(self.pathway_idx), 1)))
-        for (name, _), c in zip(self.pathway_idx.items(), colors):
-            (line,) = self.axes["path"].plot([], [], label=name, lw=1.4, color=c)
-            self._pathway_lines[name] = line
-        self.axes["path"].legend(loc="upper right", fontsize=7)
-
-        self.axes["map"] = self.fig.add_subplot(gs[1, :])
-        self.axes["map"].set_title("Active neurons (soma positions)")
-        self.axes["map"].set_xlabel("X")
-        self.axes["map"].set_ylabel("Y")
-        if self.positions is not None:
-            pos = np.asarray(self.positions)
-            self.axes["map"].scatter(pos[:, 0], pos[:, 1], s=1, c="#dddddd", alpha=0.4)
-            self._scatter = self.axes["map"].scatter([], [], s=6, c="#e74c3c", alpha=0.85)
-        else:
-            self.axes["map"].text(
-                0.5,
-                0.5,
-                "No soma positions in this brain build",
-                ha="center",
-                va="center",
-                transform=self.axes["map"].transAxes,
-            )
-
-        self._text = self.fig.text(0.01, 0.01, "", fontsize=9, family="monospace")
-        plt.tight_layout()
-        plt.show(block=False)
+            cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.window, 1280, 720)
+            print("[dashboard] Live OpenCV window opened (press Q in the window to stop early).")
 
     def update(self, t, frame, fired, pathway_counts, total_active):
-        if not self.live or self.fig is None:
-            return
-
         self._t.append(t)
         self._total.append(total_active)
         for k, v in pathway_counts.items():
             self._path[k].append(v)
 
+        if not self.live:
+            return
+
+        canvas = self._render(frame, fired, pathway_counts, total_active, t)
+        cv2.imshow(self.window, canvas)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), ord("Q"), 27):
+            # User asked to stop early — signal via attribute
+            self.stop_requested = True
+
+    @property
+    def stop_requested(self):
+        return getattr(self, "_stop", False)
+
+    @stop_requested.setter
+    def stop_requested(self, value):
+        self._stop = bool(value)
+
+    def _render(self, frame, fired, pathway_counts, total_active, t):
+        """Build a single BGR image: video + stats + bars + neuron map."""
+        W, H = 1280, 720
+        canvas = np.zeros((H, W, 3), dtype=np.uint8)
+        canvas[:] = (30, 30, 30)
+
+        # --- Left: video frame ---
         if frame is not None:
-            rgb = frame[:, :, ::-1]
-            if self._img_artist is None:
-                self._img_artist = self.axes["frame"].imshow(rgb)
-            else:
-                self._img_artist.set_data(rgb)
+            fh, fw = frame.shape[:2]
+            scale = min(620 / fw, 400 / fh)
+            nw, nh = int(fw * scale), int(fh * scale)
+            resized = cv2.resize(frame, (nw, nh))
+            y0 = 40
+            x0 = 20
+            canvas[y0 : y0 + nh, x0 : x0 + nw] = resized
+            cv2.putText(
+                canvas,
+                "Input frame",
+                (x0, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (220, 220, 220),
+                1,
+                cv2.LINE_AA,
+            )
 
-        self._total_line.set_data(self._t, self._total)
-        self.axes["total"].relim()
-        self.axes["total"].autoscale_view()
-
-        for name, line in self._pathway_lines.items():
-            line.set_data(self._t, self._path[name])
-        self.axes["path"].relim()
-        self.axes["path"].autoscale_view()
-
-        if (
-            self._scatter is not None
-            and fired is not None
-            and len(fired)
-            and self.positions is not None
-        ):
-            pos = np.asarray(self.positions)
-            idx = fired if len(fired) < 8000 else np.random.choice(fired, 8000, replace=False)
-            pts = pos[idx]
-            self._scatter.set_offsets(pts[:, :2])
-
-        self._text.set_text(
-            f"t = {t:6.2f}s   |   total active = {total_active:6d}   |   "
-            + "  ".join(f"{k}: {v}" for k, v in pathway_counts.items())
+        # --- Top-right: big numbers ---
+        cv2.putText(
+            canvas,
+            f"t = {t:6.2f} s",
+            (680, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            f"Active neurons: {total_active}",
+            (680, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            (80, 80, 255),
+            2,
+            cv2.LINE_AA,
         )
 
-        try:
-            self.fig.canvas.draw_idle()
-            self.fig.canvas.flush_events()
-            plt.pause(0.001)
-        except Exception:
-            pass
+        # --- Pathway bars ---
+        cv2.putText(
+            canvas,
+            "Pathway activity (this step)",
+            (680, 130),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
+        )
+
+        max_bar = 500
+        y = 160
+        colors = [
+            (0, 165, 255),
+            (0, 255, 128),
+            (255, 180, 0),
+            (255, 100, 255),
+            (100, 200, 255),
+            (180, 180, 80),
+        ]
+        for i, (name, count) in enumerate(pathway_counts.items()):
+            color = colors[i % len(colors)]
+            # Normalize bar length roughly (visual projection can be large)
+            bar_w = int(min(max_bar, count * 0.08 + (20 if count else 0)))
+            cv2.rectangle(canvas, (680, y), (680 + bar_w, y + 22), color, -1)
+            label = f"{name}: {count}"
+            cv2.putText(
+                canvas,
+                label,
+                (680, y + 17),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 32
+
+        # --- Bottom: activity sparkline (total) ---
+        spark_x0, spark_y0 = 20, 480
+        spark_w, spark_h = 600, 200
+        cv2.rectangle(
+            canvas,
+            (spark_x0, spark_y0),
+            (spark_x0 + spark_w, spark_y0 + spark_h),
+            (50, 50, 50),
+            -1,
+        )
+        cv2.putText(
+            canvas,
+            "Total active neurons over time",
+            (spark_x0, spark_y0 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (180, 180, 180),
+            1,
+            cv2.LINE_AA,
+        )
+
+        if len(self._total) >= 2:
+            vals = np.array(self._total[-300:], dtype=np.float32)  # last ~300 steps
+            vmin, vmax = float(vals.min()), float(vals.max())
+            if vmax <= vmin:
+                vmax = vmin + 1
+            pts = []
+            for i, v in enumerate(vals):
+                x = spark_x0 + int(i / max(len(vals) - 1, 1) * (spark_w - 1))
+                y = spark_y0 + spark_h - 1 - int((v - vmin) / (vmax - vmin) * (spark_h - 1))
+                pts.append((x, y))
+            for a, b in zip(pts, pts[1:]):
+                cv2.line(canvas, a, b, (80, 80, 255), 2, cv2.LINE_AA)
+
+        # --- Right bottom: neuron map if positions exist ---
+        map_x0, map_y0 = 680, 400
+        map_w, map_h = 560, 280
+        cv2.rectangle(
+            canvas,
+            (map_x0, map_y0),
+            (map_x0 + map_w, map_y0 + map_h),
+            (45, 45, 45),
+            -1,
+        )
+        cv2.putText(
+            canvas,
+            "Active somata (X-Y)",
+            (map_x0, map_y0 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (180, 180, 180),
+            1,
+            cv2.LINE_AA,
+        )
+
+        if self.positions is not None and fired is not None and len(fired):
+            pos = np.asarray(self.positions)
+            # Use first two coords
+            xy = pos[:, :2].astype(np.float64)
+            # Subsample
+            idx = fired if len(fired) <= 4000 else np.random.choice(fired, 4000, replace=False)
+            pts = xy[idx]
+            # Normalize into map box
+            mins = xy.min(axis=0)
+            maxs = xy.max(axis=0)
+            span = np.maximum(maxs - mins, 1e-6)
+            norm = (pts - mins) / span
+            for p in norm:
+                x = map_x0 + int(p[0] * (map_w - 1))
+                y = map_y0 + int((1 - p[1]) * (map_h - 1))
+                cv2.circle(canvas, (x, y), 1, (60, 60, 255), -1)
+        else:
+            cv2.putText(
+                canvas,
+                "No positions or no spikes",
+                (map_x0 + 40, map_y0 + map_h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (120, 120, 120),
+                1,
+                cv2.LINE_AA,
+            )
+
+        # Footer
+        cv2.putText(
+            canvas,
+            "Press Q in this window to stop early",
+            (20, H - 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (140, 140, 140),
+            1,
+            cv2.LINE_AA,
+        )
+
+        return canvas
 
     def finalize(self, times, history, total_spikes, out_dir: Path):
-        """Save high-quality static plots at the end."""
+        if self.live:
+            try:
+                cv2.destroyWindow(self.window)
+            except Exception:
+                pass
+
         if not HAS_MPL:
-            print("matplotlib not available — skipping plot save")
+            print("matplotlib not available — skipping PNG export")
             return
 
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1) Activity over time
         fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
         fig.suptitle(self.title)
 
@@ -197,7 +286,6 @@ class Dashboard:
         plt.close(fig)
         print(f"  saved {p1}")
 
-        # 2) Summary bar chart
         if history:
             names = list(history.keys())
             means = [float(np.mean(history[n])) if history[n] else 0.0 for n in names]
@@ -210,14 +298,3 @@ class Dashboard:
             fig.savefig(p2, dpi=150)
             plt.close(fig)
             print(f"  saved {p2}")
-
-        # 3) Final active-neuron map if we have positions + last fired state isn't stored;
-        #    skip detailed map here — activity plots are the main deliverable.
-
-        if self.live and self.fig is not None:
-            print("Close the live dashboard window to exit.")
-            try:
-                plt.ioff()
-                plt.show()
-            except Exception:
-                pass
