@@ -30,6 +30,23 @@ class Dashboard:
         self.positions = getattr(brain, "positions", None)
         self.live = live
 
+        # Precompute valid (non-NaN) position bounds once
+        self._xy = None
+        self._mins = None
+        self._span = None
+        if self.positions is not None:
+            pos = np.asarray(self.positions, dtype=np.float64)
+            if pos.ndim == 2 and pos.shape[1] >= 2:
+                xy = pos[:, :2]
+                valid = np.isfinite(xy).all(axis=1)
+                if valid.any():
+                    self._xy = xy
+                    self._valid_mask = valid
+                    good = xy[valid]
+                    self._mins = good.min(axis=0)
+                    maxs = good.max(axis=0)
+                    self._span = np.maximum(maxs - self._mins, 1e-6)
+
         self._t = []
         self._total = []
         self._path = {k: [] for k in pathway_idx}
@@ -53,7 +70,6 @@ class Dashboard:
         cv2.imshow(self.window, canvas)
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), ord("Q"), 27):
-            # User asked to stop early — signal via attribute
             self.stop_requested = True
 
     @property
@@ -136,7 +152,6 @@ class Dashboard:
         ]
         for i, (name, count) in enumerate(pathway_counts.items()):
             color = colors[i % len(colors)]
-            # Normalize bar length roughly (visual projection can be large)
             bar_w = int(min(max_bar, count * 0.08 + (20 if count else 0)))
             cv2.rectangle(canvas, (680, y), (680 + bar_w, y + 22), color, -1)
             label = f"{name}: {count}"
@@ -174,19 +189,19 @@ class Dashboard:
         )
 
         if len(self._total) >= 2:
-            vals = np.array(self._total[-300:], dtype=np.float32)  # last ~300 steps
+            vals = np.array(self._total[-300:], dtype=np.float32)
             vmin, vmax = float(vals.min()), float(vals.max())
             if vmax <= vmin:
                 vmax = vmin + 1
             pts = []
             for i, v in enumerate(vals):
                 x = spark_x0 + int(i / max(len(vals) - 1, 1) * (spark_w - 1))
-                y = spark_y0 + spark_h - 1 - int((v - vmin) / (vmax - vmin) * (spark_h - 1))
-                pts.append((x, y))
+                yy = spark_y0 + spark_h - 1 - int((v - vmin) / (vmax - vmin) * (spark_h - 1))
+                pts.append((x, yy))
             for a, b in zip(pts, pts[1:]):
                 cv2.line(canvas, a, b, (80, 80, 255), 2, cv2.LINE_AA)
 
-        # --- Right bottom: neuron map if positions exist ---
+        # --- Right bottom: neuron map ---
         map_x0, map_y0 = 680, 400
         map_w, map_h = 560, 280
         cv2.rectangle(
@@ -207,23 +222,33 @@ class Dashboard:
             cv2.LINE_AA,
         )
 
-        if self.positions is not None and fired is not None and len(fired):
-            pos = np.asarray(self.positions)
-            # Use first two coords
-            xy = pos[:, :2].astype(np.float64)
-            # Subsample
-            idx = fired if len(fired) <= 4000 else np.random.choice(fired, 4000, replace=False)
-            pts = xy[idx]
-            # Normalize into map box
-            mins = xy.min(axis=0)
-            maxs = xy.max(axis=0)
-            span = np.maximum(maxs - mins, 1e-6)
-            norm = (pts - mins) / span
-            for p in norm:
-                x = map_x0 + int(p[0] * (map_w - 1))
-                y = map_y0 + int((1 - p[1]) * (map_h - 1))
-                cv2.circle(canvas, (x, y), 1, (60, 60, 255), -1)
-        else:
+        drawn = False
+        if (
+            self._xy is not None
+            and self._mins is not None
+            and fired is not None
+            and len(fired)
+        ):
+            idx = np.asarray(fired, dtype=np.int64)
+            # Keep only indices that exist and have finite coords
+            idx = idx[(idx >= 0) & (idx < len(self._xy))]
+            if len(idx):
+                if len(idx) > 4000:
+                    idx = np.random.choice(idx, 4000, replace=False)
+                pts = self._xy[idx]
+                finite = np.isfinite(pts).all(axis=1)
+                pts = pts[finite]
+                if len(pts):
+                    norm = (pts - self._mins) / self._span
+                    # Clip to [0,1] just in case
+                    norm = np.clip(norm, 0.0, 1.0)
+                    for p in norm:
+                        x = map_x0 + int(p[0] * (map_w - 1))
+                        yy = map_y0 + int((1.0 - p[1]) * (map_h - 1))
+                        cv2.circle(canvas, (x, yy), 1, (60, 60, 255), -1)
+                    drawn = True
+
+        if not drawn:
             cv2.putText(
                 canvas,
                 "No positions or no spikes",
@@ -235,7 +260,6 @@ class Dashboard:
                 cv2.LINE_AA,
             )
 
-        # Footer
         cv2.putText(
             canvas,
             "Press Q in this window to stop early",
