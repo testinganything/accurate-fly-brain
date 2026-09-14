@@ -1,68 +1,102 @@
 """
-Simple but biologically-motivated visual front-end.
+Improved visual front-end for MaleCNS.
 
-Maps a grayscale frame onto groups of visual projection neurons / looming detectors
-that actually exist in the MaleCNS connectome (LC4, LPLC2, HS/VS-like, etc.).
-
-This is deliberately lightweight. More sophisticated optic-flow or columnar
-models can be swapped in later; the important part is that the *targets* are
-real cell types from the connectome.
+Uses the package's native eye_drive (photoreceptor array) when available,
+plus targeted current injection into looming / visual-projection cell types.
 """
 
 from __future__ import annotations
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 
-def frames_to_visual_drive(brain, gray: np.ndarray, gain: float = 0.8):
-    """
-    gray : 2-D uint8 or float array (H, W), luminance
-    Returns a list of (neuron_ids, current) pairs suitable for brain.step(inject=...)
-    """
-    # Normalise to 0–1
-    img = gray.astype(np.float32) / 255.0
+class VisualFrontEnd:
+    def __init__(self, brain, gain: float = 0.9):
+        self.brain = brain
+        self.gain = gain
 
-    # Very simple features that map onto known fly visual channels
-    mean_lum = float(img.mean())
-    # Crude motion proxy: difference from a heavily blurred version
-    from scipy.ndimage import gaussian_filter
-    blur = gaussian_filter(img, sigma=3.0)
-    motion = float(np.abs(img - blur).mean())
+        # Photoreceptor indices exposed by flybrain
+        self.n_visual = len(brain.visual) if hasattr(brain, "visual") else 0
 
-    # Centre-surround contrast (rough looming / object signal)
+        # Pre-resolve important visual cell groups
+        self.loom = self._safe_cells(["LC4", "LPLC2"])
+        self.vp = self._safe_cells(["visual_projection", "visual_projection_neuron"])
+        self.motion = self._safe_cells(["T4", "T5", "HS", "VS"])
+
+        # Keep a previous frame for simple motion energy
+        self.prev = None
+
+    def _safe_cells(self, types):
+        try:
+            idx = self.brain.cells(types)
+            return idx if len(idx) > 0 else np.array([], dtype=int)
+        except Exception:
+            return np.array([], dtype=int)
+
+    def encode(self, gray: np.ndarray):
+        """
+        gray : (H, W) uint8 or float luminance frame
+        Returns (eye_drive, inject)
+          eye_drive : array for brain.step(eye_drive=...) or None
+          inject    : list of (indices, amount) for brain.step(inject=...)
+        """
+        img = gray.astype(np.float32) / 255.0
+        mean_lum = float(img.mean())
+
+        # Motion energy
+        if self.prev is not None:
+            motion = float(np.abs(img - self.prev).mean())
+        else:
+            motion = 0.0
+        self.prev = img.copy()
+
+        # Centre-surround contrast (object / looming proxy)
+        h, w = img.shape
+        cy, cx = h // 2, w // 2
+        r = min(h, w) // 4
+        y, x = np.ogrid[:h, :w]
+        mask = (x - cx) ** 2 + (y - cy) ** 2 <= r ** 2
+        centre = float(img[mask].mean()) if mask.any() else mean_lum
+        surround = float(img[~mask].mean()) if (~mask).any() else mean_lum
+        contrast = abs(centre - surround)
+
+        # --- eye_drive (native photoreceptor path) ---
+        eye_drive = None
+        if self.n_visual > 0:
+            # Simple retinotopic-ish mapping: resize image to a 1-D drive
+            # of length n_visual. Real columnar mapping is more complex;
+            # this still gives spatially structured input.
+            flat = cv2_resize_1d(img, self.n_visual)
+            eye_drive = np.clip(flat * self.gain, 0.0, 1.0).astype(np.float32)
+
+        # --- targeted inject into known visual cell types ---
+        inject = []
+        loom_strength = self.gain * (0.55 * motion + 0.45 * contrast)
+        if len(self.loom):
+            inject.append((self.loom, loom_strength))
+
+        if len(self.vp):
+            inject.append((self.vp, self.gain * 0.25 * mean_lum))
+
+        if len(self.motion):
+            inject.append((self.motion, self.gain * 0.35 * motion))
+
+        return eye_drive, inject
+
+
+def cv2_resize_1d(img: np.ndarray, n: int) -> np.ndarray:
+    """Resize 2-D image to a length-n vector (row-major after modest resize)."""
+    import cv2
+    # Keep aspect, then flatten and resample to exactly n values
     h, w = img.shape
-    cy, cx = h // 2, w // 2
-    r = min(h, w) // 4
-    y, x = np.ogrid[:h, :w]
-    mask = (x - cx) ** 2 + (y - cy) ** 2 <= r ** 2
-    centre = float(img[mask].mean()) if mask.any() else mean_lum
-    surround = float(img[~mask].mean()) if (~mask).any() else mean_lum
-    contrast = abs(centre - surround)
-
-    inject = []
-
-    # Map onto real cell-type groups that exist in MaleCNS annotations.
-    try:
-        # Looming / expansion detectors (classic escape pathway)
-        loom_cells = brain.cells(["LC4", "LPLC2"], side=None)  # both sides if available
-        if len(loom_cells) > 0:
-            strength = gain * (0.4 * motion + 0.6 * contrast)
-            inject.append((loom_cells, strength))
-
-        # Broad visual projection / motion-sensitive groups (approximate)
-        for name in ["visual_projection_neuron", "VPNs", "HS", "VS", "T4", "T5"]:
-            try:
-                cells = brain.cells([name], side=None)
-                if len(cells) > 0:
-                    inject.append((cells, gain * 0.3 * mean_lum))
-                    break
-            except Exception:
-                continue
-
-    except Exception as e:
-        # If the exact cell-type lookup fails, inject a small random set so the demo still runs.
-        print(f"[visual_encoder] cell lookup note: {e}")
-        n = min(200, getattr(brain, "n", 200))
-        inject.append((np.arange(n), gain * 0.1 * mean_lum))
-
-    return inject
+    target_h = max(8, int(np.sqrt(n * h / w)))
+    target_w = max(8, n // target_h)
+    small = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    flat = small.ravel()
+    if len(flat) == n:
+        return flat
+    # Linear resample
+    x_old = np.linspace(0, 1, len(flat))
+    x_new = np.linspace(0, 1, n)
+    return np.interp(x_new, x_old, flat).astype(np.float32)
