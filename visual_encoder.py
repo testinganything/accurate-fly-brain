@@ -42,9 +42,6 @@ def frames_to_visual_drive(brain, gray: np.ndarray, gain: float = 0.8):
     inject = []
 
     # Map onto real cell-type groups that exist in MaleCNS annotations.
-    # These names are the ones used by the flybrain package / MaleCNS cell types.
-    # Adjust the list if the package exposes different labels.
-
     try:
         # Looming / expansion detectors (classic escape pathway)
         loom_cells = brain.cells(["LC4", "LPLC2"], side=None)  # both sides if available
@@ -53,7 +50,6 @@ def frames_to_visual_drive(brain, gray: np.ndarray, gain: float = 0.8):
             inject.append((loom_cells, strength))
 
         # Broad visual projection / motion-sensitive groups (approximate)
-        # Many packages expose broader super-classes; fall back gracefully.
         for name in ["visual_projection_neuron", "VPNs", "HS", "VS", "T4", "T5"]:
             try:
                 cells = brain.cells([name], side=None)
@@ -64,11 +60,9 @@ def frames_to_visual_drive(brain, gray: np.ndarray, gain: float = 0.8):
                 continue
 
     except Exception as e:
-        # If the exact cell-type lookup fails, inject a small random set of
-        # sensory-looking neurons so the demo still runs.
+        # If the exact cell-type lookup fails, inject a small random set so the demo still runs.
         print(f"[visual_encoder] cell lookup note: {e}")
-        # Fallback: mild drive on a handful of neurons so something happens
-        n = min(200, brain.n_neurons)
+        n = min(200, getattr(brain, "n", 200))
         inject.append((np.arange(n), gain * 0.1 * mean_lum))
 
     return inject

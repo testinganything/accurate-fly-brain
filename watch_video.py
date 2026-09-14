@@ -40,7 +40,9 @@ def main():
 
     print("Loading MaleCNS brain (first run downloads ~260 MB weights)...")
     brain = FlyBrain(device=args.device)
-    print(f"Brain ready — {brain.n_neurons} neurons")
+    # FlyBrain exposes the neuron count as .n (not .n_neurons)
+    n_neurons = getattr(brain, "n", getattr(brain, "n_neurons", "?"))
+    print(f"Brain ready — {n_neurons} neurons")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -49,7 +51,6 @@ def main():
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(args.duration * fps)
-    frame_interval = max(1, int(round(fps * args.dt)))  # roughly one brain step per dt
 
     print(f"Processing up to {args.duration}s of video @ ~{fps:.1f} fps")
     print("Mapping frames → visual projection / looming neurons → full CNS dynamics")
@@ -73,8 +74,6 @@ def main():
 
         # Simple readout every ~0.5 s of brain time
         if step % max(1, int(0.5 / args.dt)) == 0:
-            # Example: count spikes in a few descending / motor-related groups
-            # (exact cell names depend on the annotations loaded by flybrain)
             n_spikes = len(fired) if fired is not None else 0
             print(f"t={step * args.dt:6.2f}s | active neurons this step: {n_spikes}")
 
